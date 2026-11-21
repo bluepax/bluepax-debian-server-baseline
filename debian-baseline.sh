@@ -16,8 +16,8 @@ shopt -s nullglob
 # ---------------------------------------------------------------- 版本信息 ---
 # Bluepax Flow：SemVer 2.0，新主版本预发布为 X.0.0-beta.N，
 # N 为 build 号 = git rev-list --count --first-parent <dev 提交>
-SCRIPT_VERSION="1.0.0-beta.2"
-SCRIPT_BUILD="2"
+SCRIPT_VERSION="1.0.0-beta.3"
+SCRIPT_BUILD="3"
 SCRIPT_CODENAME="petrel"
 # 提交号与构建时间：git archive 时由 export-subst 填入（见 .gitattributes），
 # install 时写入安装副本，从 git 工作区运行时实时读取
@@ -101,7 +101,8 @@ usage() {
 debian-baseline ${SCRIPT_VERSION} — Debian 服务器初始化基线（幂等，可重复执行）
 
 用法:
-  debian-baseline.sh apply   [选项]   应用全部（或所选）设置，结束后自动验收
+  debian-baseline.sh                  交互式菜单（在终端中运行时）
+  debian-baseline.sh apply   [选项]   应用设置，结束后自动验收；在终端中会先进入交互式向导，-y 跳过
   debian-baseline.sh check   [选项]   只做验收，不修改系统；有 FAIL 时退出码为 1
   debian-baseline.sh install          把脚本安装到 ${SELF_INSTALL_PATH} 并注册 apt 自愈钩子
   debian-baseline.sh heal             重新挂载被软件包升级覆盖的钩子（由 apt 钩子自动调用）
@@ -216,7 +217,7 @@ apply_overrides() {
     if [ -n "$BL_HOSTNAME" ]; then
         valid_hostname "$BL_HOSTNAME" || die "主机名不合法: $BL_HOSTNAME（字母/数字/连字符，每段 ≤63，总长 ≤253）"
     fi
-    if [ "$ASSUME_YES" = "no" ] && [ -t 0 ]; then INTERACTIVE="yes"; fi
+    if [ "$ASSUME_YES" = "no" ] && has_tty; then INTERACTIVE="yes"; fi
 }
 
 valid_hostname() {
@@ -474,6 +475,11 @@ ensure_cloud_cfg() {
 
 step_apt() {
     local keyring types suites comps signed
+    # https 镜像需要 CA 证书：先用原有的源装好，再切换
+    if [[ $APT_MIRROR == https://* || $APT_SECURITY_MIRROR == https://* ]] && ! pkg_installed ca-certificates; then
+        info "https 镜像需要 ca-certificates，先用现有软件源安装"
+        ensure_pkgs ca-certificates
+    fi
     keyring=$(debian_keyring)
     [ -n "$keyring" ] || ensure_pkgs debian-archive-keyring
     keyring=$(debian_keyring)
@@ -659,7 +665,7 @@ step_user() {
         if [ "$INTERACTIVE" = "yes" ]; then
             info "为 $u 设置密码（sudo 与本机回环 SSH 登录使用）:"
             local i
-            for i in 1 2 3; do passwd "$u" && break; [ "$i" = 3 ] && warn "密码未设置"; done
+            for i in 1 2 3; do passwd "$u" </dev/tty && break; [ "$i" = 3 ] && warn "密码未设置"; done
         else
             warn "$u 尚未设置密码，sudo 无法使用；请执行: passwd $u"
         fi
@@ -753,6 +759,11 @@ step_ssh() {
     if id "$BL_USER" >/dev/null 2>&1; then
         home=$(user_home "$BL_USER")
         nkeys=$(count_keys "$home/.ssh/authorized_keys")
+    fi
+    if [ "$nkeys" -eq 0 ] && [ "$FORCE" != "yes" ]; then
+        if [ "$INTERACTIVE" = "yes" ] && ask_yn "$BL_USER 没有任何 SSH 公钥，禁用密码登录可能把你锁在门外。仍然继续?" n; then
+            FORCE="yes"
+        fi
     fi
     if [ "$nkeys" -eq 0 ] && [ "$FORCE" != "yes" ]; then
         die "$BL_USER 没有任何 SSH 公钥，禁用密码登录会把你锁在门外。请用 -k/-K/--import-keys-from 提供公钥，或加 --force"
@@ -1166,6 +1177,7 @@ check_persist() {
 }
 
 run_checks() {
+    CHK_PASS=0 CHK_FAIL=0 CHK_WARN=0
     log "验收"
     local s
     for s in "${STEPS[@]}"; do
@@ -1179,14 +1191,290 @@ run_checks() {
     [ "$CHK_FAIL" -eq 0 ]
 }
 
+# ================================================================ 交互界面 ===
+# 从 /dev/tty 读取输入：即使通过 `curl ... | sudo bash` 运行也能交互
+has_tty() { [ -t 1 ] && { : </dev/tty; } 2>/dev/null; }
+
+# ask VAR "提示" "默认值"
+ask() {
+    local __var=$1 __prompt=$2 __def=${3:-} __ans=""
+    [ -n "$__def" ] && __prompt="$__prompt [${__def}]"
+    IFS= read -r -p "  ${__prompt}: " __ans </dev/tty || true
+    printf -v "$__var" '%s' "${__ans:-$__def}"
+}
+
+# ask_yn "提示" [y|n]  —— 回答「是」返回 0
+ask_yn() {
+    local def=${2:-y} ans="" hint="[Y/n]"
+    [ "$def" = "n" ] && hint="[y/N]"
+    while :; do
+        IFS= read -r -p "  $1 $hint: " ans </dev/tty || true
+        ans=${ans:-$def}
+        case ${ans,,} in
+            y|yes) return 0 ;;
+            n|no)  return 1 ;;
+        esac
+        echo "  请输入 y 或 n"
+    done
+}
+
+# choose VAR "标题" 默认序号 "选项1" "选项2" ...  —— VAR 得到选中的序号
+choose() {
+    local __var=$1 __title=$2 __def=$3 __ans="" __i
+    shift 3
+    echo "  $__title"
+    for ((__i = 1; __i <= $#; __i++)); do printf '    %d) %s\n' "$__i" "${!__i}"; done
+    while :; do
+        IFS= read -r -p "  请选择 [${__def}]: " __ans </dev/tty || true
+        __ans=${__ans:-$__def}
+        if [[ $__ans =~ ^[0-9]+$ ]] && [ "$__ans" -ge 1 ] && [ "$__ans" -le $# ]; then
+            printf -v "$__var" '%s' "$__ans"
+            return 0
+        fi
+        echo "  无效选择"
+    done
+}
+
+step_title() {
+    case $1 in
+        apt)      echo "切换为当前大版本的官方 Debian 软件源（deb822 .sources）" ;;
+        packages) echo "安装基础软件包: ${BASE_PACKAGES[*]}" ;;
+        docker)   echo "添加 Docker 官方仓库（只加仓库，不安装）" ;;
+        user)     echo "创建管理用户与同名用户组，加入 sudo，配置公钥" ;;
+        shell)    echo "全局 shell 别名与彩色提示符（含 root）" ;;
+        ssh)      echo "SSH 仅公钥登录、禁 root；回环地址允许密码与 root" ;;
+        vim)      echo "Vim 行号、高亮搜索、仅插入模式鼠标" ;;
+        locale)   echo "LANG=en_US.UTF-8、时区 UTC、生成中文 locale" ;;
+        hostname) echo "设置主机名" ;;
+    esac
+}
+
+# 静默跑一遍验收，得到每个步骤当前是否已生效
+declare -A STEP_STATE=()
+probe_status() {
+    local s f w
+    for s in "${ALL_STEPS[@]}"; do
+        f=$CHK_FAIL w=$CHK_WARN CHK_STEP=$s
+        "check_$s" >/dev/null 2>&1 || true
+        if [ "$CHK_FAIL" -gt "$f" ]; then STEP_STATE[$s]="todo"
+        elif [ "$CHK_WARN" -gt "$w" ]; then STEP_STATE[$s]="warn"
+        else STEP_STATE[$s]="ok"; fi
+    done
+    CHK_PASS=0 CHK_FAIL=0 CHK_WARN=0
+}
+
+print_step_table() {
+    local i=0 s mark
+    for s in "${ALL_STEPS[@]}"; do
+        i=$((i + 1))
+        case ${STEP_STATE[$s]:-todo} in
+            ok)   mark="${C_G}✓ 已生效${C_0}" ;;
+            warn) mark="${C_Y}! 需注意${C_0}" ;;
+            *)    mark="${C_R}✗ 未生效${C_0}" ;;
+        esac
+        printf '    %d) %-9s %s  %s\n' "$i" "$s" "$mark" "$(step_title "$s")"
+    done
+}
+
+# 把「1 3 5」「1,3」「apt ssh」「a」解析为步骤列表
+parse_step_selection() {
+    local input=${1//,/ } tok out=()
+    if [ -z "$input" ] || [ "$input" = "a" ] || [ "$input" = "all" ]; then
+        STEPS=("${ALL_STEPS[@]}"); return 0
+    fi
+    for tok in $input; do
+        if [[ $tok =~ ^[0-9]+$ ]] && [ "$tok" -ge 1 ] && [ "$tok" -le ${#ALL_STEPS[@]} ]; then
+            out+=("${ALL_STEPS[$((tok - 1))]}")
+        elif _in_list "$tok" "$(IFS=,; echo "${ALL_STEPS[*]}")"; then
+            out+=("$tok")
+        else
+            return 1
+        fi
+    done
+    # 按标准执行顺序排序并去重
+    STEPS=()
+    for tok in "${ALL_STEPS[@]}"; do
+        [[ " ${out[*]} " == *" $tok "* ]] && STEPS+=("$tok")
+    done
+    [ ${#STEPS[@]} -gt 0 ]
+}
+
+key_fingerprint() {
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        ssh-keygen -lf - <<<"$1" 2>/dev/null | awk '{print $2, $NF}'
+    else
+        awk '{print $1, $3}' <<<"$1"
+    fi
+}
+
+# choose_url VAR "标题" "当前值" "名称1|URL1" "名称2|URL2" ...（最后自动追加「自定义」）
+choose_url() {
+    local __var=$1 __title=$2 __cur=$3 __def="" __n=0 __pick __u __i
+    shift 3
+    local -a labels=() urls=()
+    for __i in "$@"; do
+        __n=$((__n + 1))
+        labels+=("${__i%%|*}  ${__i#*|}"); urls+=("${__i#*|}")
+        [ "${__i#*|}" = "$__cur" ] && __def=$__n
+    done
+    labels+=("自定义地址"); __n=$((__n + 1))
+    [ -n "$__def" ] || __def=$__n
+    choose __pick "$__title" "$__def" "${labels[@]}"
+    if [ "$__pick" -eq "$__n" ]; then
+        while :; do
+            ask __u "输入地址" "$__cur"
+            [[ $__u =~ ^https?://[^[:space:]]+$ ]] && break
+            echo "  地址需以 http:// 或 https:// 开头"
+        done
+        printf -v "$__var" '%s' "${__u%/}"
+    else
+        printf -v "$__var" '%s' "${urls[$((__pick - 1))]}"
+    fi
+}
+
+wizard() {
+    echo
+    log "交互式向导（直接回车使用方括号中的默认值，Ctrl+C 随时退出）"
+    info "正在检测各项当前状态 ..."
+    probe_status
+    echo
+    echo "  ${C_B}1. 选择步骤${C_0}"
+    print_step_table
+    local sel
+    while :; do
+        ask sel "要执行的步骤（序号或名称，空格分隔；a = 全部，可重复执行）" "a"
+        parse_step_selection "$sel" && break
+        echo "  无法识别: $sel"
+    done
+
+    echo
+    echo "  ${C_B}2. 参数${C_0}"
+    local v
+    if step_selected user || step_selected ssh || step_selected shell; then
+        while :; do
+            ask v "管理用户名" "$BL_USER"
+            [[ $v =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] && break
+            echo "  用户名只能包含小写字母、数字、_ 和 -"
+        done
+        BL_USER=$v
+    fi
+    if step_selected hostname; then
+        while :; do
+            ask v "主机名（可为 FQDN，如 web-01.example.com）" "${BL_HOSTNAME:-$(hostname)}"
+            valid_hostname "$v" && break
+            echo "  主机名不合法（字母/数字/连字符，每段 ≤63）"
+        done
+        BL_HOSTNAME=$v
+    fi
+    if step_selected apt; then
+        local -a opts=("Debian 官方|http://deb.debian.org/debian")
+        case $DMI_VENDOR in
+            *Alibaba*) opts+=("阿里云内网镜像|http://mirrors.cloud.aliyuncs.com/debian") ;;
+            *Tencent*) opts+=("腾讯云内网镜像|http://mirrors.tencentyun.com/debian") ;;
+        esac
+        opts+=("阿里云公网镜像|https://mirrors.aliyun.com/debian" "清华大学镜像|https://mirrors.tuna.tsinghua.edu.cn/debian")
+        choose_url APT_MIRROR "Debian 主仓库（${CODENAME}）" "$APT_MIRROR" "${opts[@]}"
+        # 安全仓库默认跟随主仓库所在镜像站
+        case $APT_MIRROR in
+            http://deb.debian.org/debian) v="http://security.debian.org/debian-security" ;;
+            */debian) v="${APT_MIRROR%/debian}/debian-security" ;;
+            *) v=$APT_SECURITY_MIRROR ;;
+        esac
+        ask APT_SECURITY_MIRROR "安全更新仓库" "$v"
+        APT_SECURITY_MIRROR=${APT_SECURITY_MIRROR%/}
+        if ask_yn "启用 backports 仓库?" "$( [ "$APT_BACKPORTS" = yes ] && echo y || echo n )"; then APT_BACKPORTS=yes; else APT_BACKPORTS=no; fi
+        if ask_yn "启用源码仓库 deb-src?" "$( [ "$APT_WITH_SRC" = yes ] && echo y || echo n )"; then APT_WITH_SRC=yes; else APT_WITH_SRC=no; fi
+    fi
+    if step_selected docker; then
+        choose_url DOCKER_MIRROR "Docker 仓库" "$DOCKER_MIRROR" \
+            "Docker 官方|https://download.docker.com/linux/debian" \
+            "阿里云镜像|https://mirrors.aliyun.com/docker-ce/linux/debian" \
+            "清华大学镜像|https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian"
+    fi
+    if step_selected user || step_selected ssh; then
+        local k
+        if [ "$BL_USER" = "$DEFAULT_USER" ]; then
+            for k in "${DEFAULT_USER_KEYS[@]}"; do info "将为 $BL_USER 安装默认公钥: $(key_fingerprint "$k")"; done
+        fi
+        info "如需再添加公钥，逐行粘贴（ssh-ed25519 AAAA... 格式），直接回车结束:"
+        while :; do
+            IFS= read -r -p "  公钥> " k </dev/tty || k=""
+            [ -n "$k" ] || break
+            if [ -n "$(printf '%s\n' "$k" | extract_keys)" ]; then
+                SSH_KEYS+=("$k"); info "已加入: $(key_fingerprint "$k")"
+            else
+                echo "  不是有效的公钥行，已忽略"
+            fi
+        done
+    fi
+
+    echo
+    echo "  ${C_B}3. 确认${C_0}"
+    local s
+    for s in "${STEPS[@]}"; do printf '    • %-9s %s\n' "$s" "$(step_title "$s")"; done
+    echo
+    step_selected user     && info "用户:     $BL_USER（额外公钥 ${#SSH_KEYS[@]} 把）"
+    step_selected hostname && info "主机名:   $BL_HOSTNAME"
+    step_selected apt      && info "apt:      $APT_MIRROR | $APT_SECURITY_MIRROR（backports: $APT_BACKPORTS, deb-src: $APT_WITH_SRC）"
+    step_selected docker   && info "docker:   $DOCKER_MIRROR"
+    if step_selected ssh; then
+        warn "SSH 将禁用密码登录：执行后请保持当前会话，另开终端确认 $BL_USER 能用公钥登录"
+    fi
+    echo
+    ask_yn "确认执行?" y || { info "已取消，未做任何修改"; exit 0; }
+}
+
+menu() {
+    local op
+    while :; do
+        echo
+        choose op "请选择操作" 1 \
+            "初始化 / 重新对齐（交互式向导）" \
+            "验收检查（只读）" \
+            "安装到 $SELF_INSTALL_PATH" \
+            "版本信息" \
+            "退出"
+        case $op in
+            1) do_apply ;;
+            2) run_checks || true ;;
+            3) install_self ;;
+            4) print_version ;;
+            5) exit 0 ;;
+        esac
+    done
+}
+
+do_apply() {
+    if [ "$INTERACTIVE" = "yes" ]; then
+        wizard
+    else
+        mirror_hint
+    fi
+    wait_cloud_init
+
+    local s i=0
+    for s in "${STEPS[@]}"; do
+        i=$((i + 1))
+        log "[$i/${#STEPS[@]}] $s — $(step_title "$s")"
+        "step_$s"
+    done
+
+    log "持久化"
+    install_self
+    save_conf
+    [ -n "$BACKUP_DIR" ] && info "被修改文件的原始版本备份在: $BACKUP_DIR"
+    echo
+    if run_checks; then exit 0; else exit 1; fi
+}
+
 # ================================================================== 入口 ===
 main() {
     local cmd=${1:-}
-    [ $# -gt 0 ] && shift
     case $cmd in
-        apply|check|heal|install) ;;
-        -h|--help|help|"") usage; exit 0 ;;
+        apply|check|heal|install|menu) shift ;;
+        -h|--help|help) usage; exit 0 ;;
         -V|--version|version) resolve_build_info; print_version; exit 0 ;;
+        ""|-*) cmd="menu" ;;   # 无子命令：交互菜单（可带参数作为默认值）
         *) die "未知子命令: $cmd（--help 查看用法）" ;;
     esac
     parse_args "$@"
@@ -1204,37 +1492,17 @@ main() {
     apply_overrides
     detect_env
     select_steps
+
+    if [ "$cmd" = "menu" ] && [ "$INTERACTIVE" != "yes" ]; then
+        usage; exit 0
+    fi
     print_env
 
-    if [ "$cmd" = "check" ]; then
-        if run_checks; then exit 0; else exit 1; fi
-    fi
-
-    # apply
-    if step_selected hostname && [ -z "$BL_HOSTNAME" ] && [ "$INTERACTIVE" = "yes" ]; then
-        local h
-        read -r -p "请输入主机名（留空跳过）: " h
-        if [ -n "$h" ]; then
-            valid_hostname "$h" || die "主机名不合法: $h"
-            BL_HOSTNAME=$h
-        fi
-    fi
-    wait_cloud_init
-    mirror_hint
-
-    local s i=0
-    for s in "${STEPS[@]}"; do
-        i=$((i + 1))
-        log "[$i/${#STEPS[@]}] $s"
-        "step_$s"
-    done
-
-    log "持久化"
-    install_self
-    save_conf
-    [ -n "$BACKUP_DIR" ] && info "被修改文件的原始版本备份在: $BACKUP_DIR"
-    echo
-    if run_checks; then exit 0; else exit 1; fi
+    case $cmd in
+        check) if run_checks; then exit 0; else exit 1; fi ;;
+        apply) do_apply ;;
+        menu)  menu ;;
+    esac
 }
 
 main "$@"
