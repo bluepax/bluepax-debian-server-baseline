@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# fill SCRIPT_COMMIT / SCRIPT_DATE in git archive / GitHub source downloads
+debian-baseline.sh export-subst
