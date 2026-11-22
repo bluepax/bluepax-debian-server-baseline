@@ -9,14 +9,29 @@
 ```bash
 git clone https://github.com/bluepax/bluepax-debian-server-baseline.git
 cd bluepax-debian-server-baseline
-sudo ./debian-baseline.sh apply -n web-01 -K ~/.ssh/id_ed25519.pub
+sudo ./debian-baseline.sh
 ```
 
-首次 `apply` 后脚本会安装到 `/usr/local/sbin/debian-baseline`，参数记录在 `/etc/debian-baseline.conf`，以后直接执行：
+在终端中运行时，脚本默认是**交互式**的：
+
+1. 主菜单：初始化或重新对齐、验收检查、安装到系统、版本信息。
+2. 向导第一步：检测每个步骤当前是否已生效（✓ 已生效 / ✗ 未生效 / ! 需注意），由你选择要执行哪些步骤，默认全部执行，可以重复执行。
+3. 向导第二步：根据所选步骤询问参数，包括管理用户名、主机名、Debian 镜像（官方、云厂商内网、阿里云、清华或自定义）、安全仓库、backports、deb-src、Docker 镜像，以及要额外粘贴的公钥。方括号里是默认值，直接回车即可采用。
+4. 汇总确认后执行，执行中会提示为 `gb117` 设置密码，最后自动验收。
+
+输入从 `/dev/tty` 读取，所以 `curl -fsSL <脚本地址> | sudo bash` 也能交互。
+
+首次执行后，脚本会安装到 `/usr/local/sbin/debian-baseline`，选择的参数会记录到 `/etc/debian-baseline.conf`，作为下次运行时的默认值：
 
 ```bash
+sudo debian-baseline           # 交互菜单
 sudo debian-baseline check     # 只验收，不修改；有 FAIL 时退出码为 1
-sudo debian-baseline apply     # 按上次的参数重新对齐（例如大版本升级后）
+```
+
+**非交互（自动化、cloud-init user-data、CI）**：加 `-y` 后不做任何询问，参数全部来自命令行或上次记录的配置：
+
+```bash
+sudo ./debian-baseline.sh apply -y -n web-01 -K ~/.ssh/id_ed25519.pub
 ```
 
 ## 做了什么
@@ -54,7 +69,7 @@ sudo debian-baseline apply     # 按上次的参数重新对齐（例如大版�
     --release CODENAME     用指定代号写 apt 源（大版本升级前使用）
     --only a,b / --skip a,b  只执行 / 跳过某些步骤：apt packages docker user shell ssh vim locale hostname
     --force                管理用户没有公钥时仍禁用 SSH 密码登录
--y, --yes                  非交互
+-y, --yes                  非交互：不显示菜单和向导，不做任何询问
 -V, --version              版本号、build 号、构建时间与提交号
 ```
 
