@@ -9,6 +9,16 @@
 #
 # 用法: debian-baseline.sh <apply|check|heal|install> [选项]   (详见 --help)
 #
+# 必须用 bash ≥ 4 运行（用 sh/dash 或 macOS 自带的 bash 3.2 会报难懂的语法错误）
+if [ -z "${BASH_VERSION:-}" ]; then
+    echo "debian-baseline: 请用 bash 运行，例如: sudo bash $0" >&2
+    exit 1
+fi
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "debian-baseline: 需要 bash 4 或更新版本（当前 $BASH_VERSION）" >&2
+    exit 1
+fi
+
 # shellcheck disable=SC2317  # step_*/check_* are called indirectly
 set -Eeuo pipefail
 shopt -s nullglob
@@ -16,8 +26,8 @@ shopt -s nullglob
 # ---------------------------------------------------------------- 版本信息 ---
 # Bluepax Flow：SemVer 2.0，新主版本预发布为 X.0.0-beta.N，
 # N 为 build 号 = git rev-list --count --first-parent <dev 提交>
-SCRIPT_VERSION="1.0.0-beta.4"
-SCRIPT_BUILD="4"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_BUILD="5"
 SCRIPT_CODENAME="petrel"
 # 提交号与构建时间：git archive 时由 export-subst 填入（见 .gitattributes），
 # install 时写入安装副本，从 git 工作区运行时实时读取
@@ -134,10 +144,12 @@ EOF
 
 # 解析提交号与构建时间：export-subst/install 已填入则直接使用，否则从 git 工作区读取
 resolve_build_info() {
-    local dir
+    local dir src
     if [[ $SCRIPT_COMMIT == '$Format'* ]] || [[ $SCRIPT_DATE == '$Format'* ]]; then
-        dir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo .)")
-        if command -v git >/dev/null 2>&1 &&
+        # 只读取脚本自身所在的 git 工作区；通过管道运行时没有脚本文件，不能去读当前目录
+        src=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)
+        dir=$(dirname "${src:-/nonexistent/x}")
+        if [ -f "$src" ] && command -v git >/dev/null 2>&1 &&
            git -c safe.directory='*' -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
             SCRIPT_COMMIT=$(git -c safe.directory='*' -C "$dir" rev-parse --short HEAD 2>/dev/null || echo unknown)
             SCRIPT_DATE=$(git -c safe.directory='*' -C "$dir" log -1 --format=%cI 2>/dev/null || echo unknown)
@@ -211,6 +223,7 @@ apply_overrides() {
     [ -n "$OPT_DOCKER_MIRROR" ]   && DOCKER_MIRROR=$OPT_DOCKER_MIRROR
     [ -n "$OPT_WITH_SRC" ]        && APT_WITH_SRC=$OPT_WITH_SRC
     [ -n "$OPT_BACKPORTS" ]       && APT_BACKPORTS=$OPT_BACKPORTS
+    BL_HOSTNAME=${BL_HOSTNAME,,}   # 主机名不区分大小写，统一小写，避免验收比较失败
     APT_MIRROR=${APT_MIRROR%/} APT_SECURITY_MIRROR=${APT_SECURITY_MIRROR%/} DOCKER_MIRROR=${DOCKER_MIRROR%/}
 
     [[ $BL_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "用户名不合法: $BL_USER"
@@ -325,7 +338,8 @@ mirror_hint() {
 backup_file() {
     local f=$1
     [ -e "$f" ] || return 0
-    [ -n "$BACKUP_DIR" ] || BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+    # 每次运行一个独立目录（含进程号，同一秒内多次运行也不会混用备份）
+    [ -n "$BACKUP_DIR" ] || BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
     mkdir -p "$BACKUP_DIR$(dirname "$f")"
     [ -e "$BACKUP_DIR$f" ] || cp -a "$f" "$BACKUP_DIR$f"
 }
@@ -361,7 +375,8 @@ install_content() {
 ensure_block() {
     local file=$1 content=$2 mode=0644
     [ -f "$file" ] && mode=$(stat -c %a "$file")
-    {
+    # 用进程替换而不是管道：install_content 必须在当前 shell 运行，FILE_CHANGED/BACKUP_DIR 才能传回
+    install_content "$file" "$mode" < <(
         if [ -f "$file" ]; then
             awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
                 $0 == b { skip = 1; next }
@@ -371,7 +386,7 @@ ensure_block() {
             ' "$file"
         fi
         printf '\n%s\n%s\n%s\n' "$MARK_BEGIN" "$content" "$MARK_END"
-    } | install_content "$file" "$mode"
+    )
 }
 
 has_block() { [ -f "$1" ] && grep -qxF "$MARK_BEGIN" "$1"; }
@@ -383,17 +398,42 @@ apt_get() {
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
 }
 
+# apt-get update 的错误行（下载失败、GPG 错误、源文件格式错误等）
+readonly APT_ERR_RE='^(E:|Err:|W: (Failed to fetch|GPG error|The repository))'
+APT_UPDATE_OUT=""
+
+# 运行 apt-get update；任一软件源失败时返回 1，输出保存在 APT_UPDATE_OUT
 apt_update() {
-    local out rc=0
+    local rc=0
     info "apt-get update ..."
-    out=$(apt_get update 2>&1) || rc=$?
+    APT_UPDATE_OUT=$(apt_get update 2>&1) || rc=$?
     APT_UPDATED="yes"
-    if [ $rc -ne 0 ] || grep -qE '^(E|Err):' <<<"$out"; then
-        printf '%s\n' "$out" | grep -E '^(E|Err|W):' >&2 || true
+    if [ $rc -ne 0 ] || grep -qE "$APT_ERR_RE" <<<"$APT_UPDATE_OUT"; then
         return 1
     fi
-    { grep -E '^W:' <<<"$out" || true; } | while IFS= read -r l; do warn "$l"; done
+    { grep -E '^W:' <<<"$APT_UPDATE_OUT" || true; } | while IFS= read -r l; do warn "$l"; done
     return 0
+}
+
+# 上次 apt-get update 中与给定 URL/文件有关的错误行
+apt_errors_for() {
+    local needle
+    for needle in "$@"; do
+        grep -E "$APT_ERR_RE" <<<"$APT_UPDATE_OUT" | grep -F -- "$needle" || true
+    done | sort -u
+}
+
+# 与本脚本无关的软件源失败：只提示，不影响本步骤
+WARNED_REPOS=" "
+warn_other_apt_errors() {
+    local repo
+    # 每个失败的源只提示一次（同一次运行里多次 apt update 也不重复）
+    while IFS= read -r repo; do
+        [ -n "$repo" ] || continue
+        [[ $WARNED_REPOS == *" $repo "* ]] && continue
+        WARNED_REPOS="$WARNED_REPOS$repo "
+        warn "其它软件源更新失败（与本脚本无关，已忽略）: $repo"
+    done < <(grep -E "$APT_ERR_RE" <<<"$APT_UPDATE_OUT" | grep -oE "(https?|ftp|file|mirror\+[a-z]+)://[^ ']+" | sort -u || true)
 }
 
 pkg_installed() { [ "$(dpkg-query -W -f='${db:Status-Status}' "$1" 2>/dev/null)" = "installed" ]; }
@@ -402,7 +442,10 @@ ensure_pkgs() {
     local p missing=()
     for p in "$@"; do pkg_installed "$p" || missing+=("$p"); done
     [ ${#missing[@]} -eq 0 ] && return 0
-    [ "$APT_UPDATED" = "yes" ] || apt_update || die "apt-get update 失败"
+    if [ "$APT_UPDATED" != "yes" ] && ! apt_update; then
+        warn_other_apt_errors
+        warn "部分软件源更新失败，继续尝试安装"
+    fi
     info "安装: ${missing[*]}（日志: $APT_LOG）"
     if ! apt_get install -y "${missing[@]}" >>"$APT_LOG" 2>&1; then
         tail -n 20 "$APT_LOG" >&2
@@ -418,26 +461,97 @@ debian_keyring() {
     echo ""
 }
 
-# 是否为 Debian 官方/镜像仓库的源文件（排除 Docker 等第三方）
-is_debian_archive_file() {
-    local f=$1
-    grep -Eqi 'download\.docker\.com|/docker-ce/' "$f" && return 1
-    case $f in
-        *.list)
-            grep -Eq "^[[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?[^[:space:]#]+/debian(-security)?/?[[:space:]]+${DEBIAN_SUITES_RE}[[:space:]]" "$f" ;;
-        *.sources)
-            grep -Eqi '^URIs:.*/debian(-security)?/?([[:space:]]|$)' "$f" &&
-            grep -Eqi "^Suites:(.*[[:space:]])?${DEBIAN_SUITES_RE}([[:space:]]|$)" "$f" ;;
-        *) return 1 ;;
-    esac
+# 识别 Debian 官方/镜像仓库的条目（逐条判断，第三方条目不受影响）：
+#   URI 以 /debian 或 /debian-security 结尾、套件是 Debian 代号、
+#   组件全部是 main/contrib/non-free/non-free-firmware、
+#   signed-by 为空或是 debian-archive-keyring
+# 例如 nginx.org/packages/debian bookworm nginx、repo.mysql.com/apt/debian bookworm mysql-8.0
+# 的组件不是 Debian 组件，因此不会被误判。
+# 变量: fmt=list|deb822  mode=classify（输出「启用条目数 Debian条目数」）|disable（输出停用后的内容）
+readonly APT_ENTRY_AWK='
+function trim(x) { sub(/^[ \t]+/, "", x); sub(/[ \t]+$/, "", x); return x }
+function okuri(u) { sub(/\/+$/, "", u); return u ~ /\/debian(-security)?$/ && u !~ /download\.docker\.com|\/docker-ce\// }
+function isdeb(uris, suites, comps, sb,   a, n, i, hit) {
+    n = split(uris, a); if (n == 0) return 0
+    for (i = 1; i <= n; i++) if (!okuri(a[i])) return 0
+    n = split(suites, a); hit = 0
+    for (i = 1; i <= n; i++) if (a[i] ~ ("^" suite_re "$")) hit = 1
+    if (!hit) return 0
+    n = split(comps, a); if (n == 0) return 0
+    for (i = 1; i <= n; i++) if (a[i] !~ /^(main|contrib|non-free|non-free-firmware)$/) return 0
+    return sb == "" || sb ~ /debian-archive-keyring/
+}
+function list_entry(line,   t, n, i, j, opts, comps, sb) {
+    if (line ~ /^[ \t]*(#|$)/) return -1
+    sub(/[ \t]#.*/, "", line)
+    n = split(line, t)
+    if (t[1] != "deb" && t[1] != "deb-src") return -1
+    i = 2; opts = ""
+    if (t[2] ~ /^\[/) { while (i <= n) { opts = opts " " t[i]; if (t[i++] ~ /\]$/) break } }
+    comps = ""; for (j = i + 2; j <= n; j++) comps = comps " " t[j]
+    sb = ""; if (match(opts, /signed-by=[^ \]]+/)) sb = substr(opts, RSTART, RLENGTH)
+    return isdeb(t[i], t[i + 1], comps, sb)
+}
+function flush(   d, i, en) {
+    if (n == 0) return
+    en = tolower(f["enabled"]) != "no"
+    d = en && isdeb(f["uris"], f["suites"], f["components"], f["signed-by"])
+    if (en) { total++; if (d) deb++ }
+    if (mode == "disable") {
+        for (i = 1; i <= n; i++) if (!(d && tolower(lines[i]) ~ /^enabled:/)) print lines[i]
+        if (d) print "Enabled: no"
+    }
+    n = 0; key = ""; split("", f)
+}
+fmt == "list" {
+    r = list_entry($0)
+    if (r >= 0) { total++; if (r) deb++ }
+    if (mode == "disable") print (r == 1 ? "# [disabled by debian-baseline] " : "") $0
+    next
+}
+/^[ \t]*$/ { flush(); if (mode == "disable") print; next }
+{
+    lines[++n] = $0
+    if ($0 ~ /^#/) next
+    if ($0 ~ /^[ \t]/) { if (key != "") f[key] = f[key] " " trim($0); next }
+    p = index($0, ":"); if (p == 0) next
+    key = tolower(trim(substr($0, 1, p - 1))); f[key] = trim(substr($0, p + 1))
+}
+END { if (fmt != "list") flush(); if (mode == "classify") print total + 0, deb + 0 }
+'
+
+_apt_awk() {  # MODE FILE
+    local fmt=list
+    [[ $2 == *.sources ]] && fmt=deb822
+    awk -v mode="$1" -v fmt="$fmt" -v suite_re="$DEBIAN_SUITES_RE" "$APT_ENTRY_AWK" "$2"
 }
 
-# 输出与 Debian 仓库冲突的其它源文件
+# 文件中启用的 Debian 仓库条目数
+debian_entry_count() {
+    local total=0 deb=0
+    [ -f "$1" ] && read -r total deb < <(_apt_awk classify "$1")
+    echo "${deb:-0}"
+}
+
+# 停用文件中的 Debian 仓库条目：整个文件都是 Debian 条目则移走（先备份），否则只停用这些条目
+disable_debian_entries() {
+    local f=$1 total=0 deb=0
+    read -r total deb < <(_apt_awk classify "$f")
+    [ "${deb:-0}" -gt 0 ] || return 0
+    if [ "$f" != /etc/apt/sources.list ] && [ "$deb" -eq "$total" ]; then
+        disable_file "$f"
+    else
+        install_content "$f" "$(stat -c %a "$f")" < <(_apt_awk disable "$f")
+        info "已停用 $f 中的 $deb 条 Debian 源（其它 $((total - deb)) 条保留）"
+    fi
+}
+
+# 输出含有其它 Debian 仓库条目的源文件（本脚本管理的文件除外）
 conflicting_debian_sources() {
     local f
-    for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         [ "$f" = "$DEBIAN_SOURCES" ] || [ "$f" = "$DOCKER_SOURCES" ] && continue
-        is_debian_archive_file "$f" && echo "$f"
+        [ "$(debian_entry_count "$f")" -gt 0 ] && echo "$f"
     done
     return 0
 }
@@ -451,12 +565,11 @@ other_docker_sources() {
     return 0
 }
 
-sources_list_active() { [ -f /etc/apt/sources.list ] && grep -Eq '^[[:space:]]*deb' /etc/apt/sources.list; }
 
 # ---------------------------------------------------------------- cloud-init ---
 ensure_cloud_cfg() {
     [ -d /etc/cloud ] || return 0
-    {
+    install_content "$CLOUD_CFG" 0644 < <(
         echo "#cloud-config"
         echo "# $MANAGED_HEADER"
         echo "# Keep cloud-init from reverting settings applied by debian-baseline"
@@ -468,7 +581,7 @@ ensure_cloud_cfg() {
             echo "preserve_hostname: true"
             echo "manage_etc_hosts: false"
         fi
-    } | install_content "$CLOUD_CFG" 0644
+    )
 }
 
 # ================================================================== 步骤 ===
@@ -505,23 +618,21 @@ Components: $comps
 ${signed}
 EOF
 
-    if sources_list_active; then
-        install_content /etc/apt/sources.list 0644 <<EOF
-# $MANAGED_HEADER
-# Debian sources moved to $DEBIAN_SOURCES (deb822 format).
-# Original content was backed up under $BACKUP_ROOT/.
-EOF
-    fi
-
-    local f
+    # 停用其它位置的 Debian 源（含 sources.list），第三方条目保留
+    local f errs
     while IFS= read -r f; do
-        [ -n "$f" ] && disable_file "$f"
+        [ -n "$f" ] && disable_debian_entries "$f"
     done < <(conflicting_debian_sources)
 
     ensure_cloud_cfg
 
-    if ! apt_update; then
-        warn "apt-get update 失败，正在还原 apt 源 ..."
+    apt_update || true
+    errs=$(apt_errors_for "$APT_MIRROR" "$APT_SECURITY_MIRROR" "$DEBIAN_SOURCES")
+    if [ -z "$errs" ]; then
+        warn_other_apt_errors
+    else
+        printf '%s\n' "$errs" >&2
+        warn "新的 Debian 源不可用，正在还原 apt 源 ..."
         if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR/etc/apt" ]; then
             [ -e "$BACKUP_DIR$DEBIAN_SOURCES" ] || rm -f "$DEBIAN_SOURCES"
             cp -a "$BACKUP_DIR/etc/apt/." /etc/apt/
@@ -575,7 +686,17 @@ Components: stable
 Architectures: $arch
 Signed-By: $DOCKER_KEY
 EOF
-    apt_update || die "添加 Docker 仓库后 apt-get update 失败"
+    local errs
+    apt_update || true
+    errs=$(apt_errors_for "$DOCKER_MIRROR" "$DOCKER_SOURCES")
+    if [ -n "$errs" ]; then
+        printf '%s\n' "$errs" >&2
+        # 撤掉不可用的 Docker 源，避免之后每次 apt update 都报错
+        if [ -n "$BACKUP_DIR" ] && [ -e "$BACKUP_DIR$DOCKER_SOURCES" ]; then cp -a "$BACKUP_DIR$DOCKER_SOURCES" "$DOCKER_SOURCES"
+        else rm -f "$DOCKER_SOURCES"; fi
+        die "Docker 仓库不可用（可用 --docker-mirror 指定镜像），已撤销 $DOCKER_SOURCES"
+    fi
+    warn_other_apt_errors
 }
 
 # 从 stdin 提取规范化的公钥行
@@ -736,7 +857,7 @@ ensure_sshd_include() {
     FILE_CHANGED=0
     [ -f "$cfg" ] || return 0
     if ! grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$cfg"; then
-        { echo "Include /etc/ssh/sshd_config.d/*.conf"; cat "$cfg"; } | install_content "$cfg" 0644
+        install_content "$cfg" 0644 < <(echo "Include /etc/ssh/sshd_config.d/*.conf"; cat "$cfg")
     fi
 }
 
@@ -749,6 +870,10 @@ reload_sshd() {
                 return 0
             fi
         done
+        if systemctl is-active --quiet ssh.socket; then
+            info "sshd 由 ssh.socket 按需启动，新连接会直接使用新配置"
+            return 0
+        fi
     fi
     warn "sshd 未在运行（或无 systemd），配置将在其下次启动时生效"
 }
@@ -797,7 +922,10 @@ EOF
         warn "sshd 配置校验失败: $err"
         if [ -n "$BACKUP_DIR" ] && [ -e "$BACKUP_DIR$SSHD_DROPIN" ]; then cp -a "$BACKUP_DIR$SSHD_DROPIN" "$SSHD_DROPIN"
         else rm -f "$SSHD_DROPIN"; fi
-        die "已还原 $SSHD_DROPIN，sshd 配置未改变"
+        if [ "$inc_changed" = 1 ] && [ -e "$BACKUP_DIR/etc/ssh/sshd_config" ]; then
+            cp -a "$BACKUP_DIR/etc/ssh/sshd_config" /etc/ssh/sshd_config
+        fi
+        die "已还原 sshd 配置，未做任何改变"
     fi
     ensure_cloud_cfg
     [ "$changed" = 1 ] && reload_sshd
@@ -863,7 +991,7 @@ EOF
         else ln -sfn "/usr/share/zoneinfo/$SYSTEM_TZ" /etc/localtime; fi
         info "已设置时区 $SYSTEM_TZ"
     fi
-    if [ -f /etc/timezone ]; then echo "$SYSTEM_TZ" | install_content /etc/timezone 0644; fi
+    if [ -f /etc/timezone ]; then install_content /etc/timezone 0644 <<<"$SYSTEM_TZ"; fi
     return 0
 }
 
@@ -874,7 +1002,7 @@ step_hostname() {
     fi
     local h=$BL_HOSTNAME short line
     short=${h%%.*}
-    echo "$h" | install_content /etc/hostname 0644
+    install_content /etc/hostname 0644 <<<"$h"
     if [ "$HAS_SYSTEMD" = "yes" ] && command -v hostnamectl >/dev/null 2>&1; then
         hostnamectl set-hostname "$h" 2>/dev/null || hostname "$h" 2>/dev/null || warn "无法设置运行中的主机名"
     else
@@ -882,11 +1010,11 @@ step_hostname() {
     fi
 
     line=$(printf '127.0.1.1\t%s' "$h"); [ "$short" != "$h" ] && line="$line $short"
-    awk -v l="$line" '
+    install_content /etc/hosts 0644 < <(awk -v l="$line" '
         /^[[:space:]]*127\.0\.1\.1[[:space:]]/ { if (!done) print l; done = 1; next }
         { print }
         END { if (!done) print l }
-    ' /etc/hosts | install_content /etc/hosts 0644
+    ' /etc/hosts)
     ensure_cloud_cfg
 }
 
@@ -925,7 +1053,7 @@ do_heal() {
 }
 
 save_conf() {
-    {
+    install_content "$CONF_FILE" 0644 < <(
         echo "# $MANAGED_HEADER"
         echo "# Parameters of the last 'apply'; reused by later runs. Command-line options win."
         printf 'BL_USER=%q\n' "$BL_USER"
@@ -935,7 +1063,7 @@ save_conf() {
         printf 'DOCKER_MIRROR=%q\n' "$DOCKER_MIRROR"
         printf 'APT_WITH_SRC=%q\n' "$APT_WITH_SRC"
         printf 'APT_BACKPORTS=%q\n' "$APT_BACKPORTS"
-    } | install_content "$CONF_FILE" 0644
+    )
 }
 
 # ================================================================== 验收 ===
@@ -970,10 +1098,10 @@ check_apt() {
     else
         fail "源中的代号不是 ${CODENAME}（大版本升级后请重新 apply）"
     fi
-    if sources_list_active; then fail "/etc/apt/sources.list 仍有启用的条目"; else pass "/etc/apt/sources.list 无启用条目"; fi
     local others
     others=$(conflicting_debian_sources | tr '\n' ' ')
-    if [ -n "$others" ]; then fail "存在其它 Debian 源文件: $others"; else pass "无重复/冲突的 Debian 源文件"; fi
+    if [ -n "$others" ]; then fail "其它文件中仍有启用的 Debian 源: $others"
+    else pass "sources.list 及 sources.list.d 中没有重复的 Debian 源"; fi
 
     local pol
     pol=$(apt-cache policy 2>/dev/null || true)
@@ -1107,7 +1235,8 @@ check_ssh() {
     expect "::1 permitrootlogin"                "$(kv permitrootlogin "$l6")" yes
 
     if [ "$HAS_SYSTEMD" = "yes" ]; then
-        if systemctl is-active --quiet ssh.service || systemctl is-active --quiet sshd.service; then
+        if systemctl is-active --quiet ssh.service || systemctl is-active --quiet sshd.service ||
+           systemctl is-active --quiet ssh.socket; then
             pass "ssh 服务运行中"
         else
             cwarn "ssh 服务未运行"
@@ -1193,7 +1322,8 @@ run_checks() {
 
 # ================================================================ 交互界面 ===
 # 从 /dev/tty 读取输入：即使通过 `curl ... | sudo bash` 运行也能交互
-has_tty() { [ -t 1 ] && { : </dev/tty; } 2>/dev/null; }
+# 只要能打开控制终端就算交互（输出经过 `| tee log` 时依然可以交互）
+has_tty() { { : </dev/tty; } 2>/dev/null; }
 
 # ask VAR "提示" "默认值"
 ask() {
@@ -1340,9 +1470,11 @@ wizard() {
     echo
     echo "  ${C_B}1. 选择步骤${C_0}"
     print_step_table
-    local sel
+    local sel def="a"
+    # 命令行给了 --only/--skip 时，以它们选中的步骤作为默认值
+    [ ${#STEPS[@]} -eq ${#ALL_STEPS[@]} ] || def="${STEPS[*]}"
     while :; do
-        ask sel "要执行的步骤（序号或名称，空格分隔；a = 全部，可重复执行）" "a"
+        ask sel "要执行的步骤（序号或名称，空格分隔；a = 全部，可重复执行）" "$def"
         parse_step_selection "$sel" && break
         echo "  无法识别: $sel"
     done
@@ -1364,7 +1496,7 @@ wizard() {
             valid_hostname "$v" && break
             echo "  主机名不合法（字母/数字/连字符，每段 ≤63）"
         done
-        BL_HOSTNAME=$v
+        BL_HOSTNAME=${v,,}
     fi
     if step_selected apt; then
         local -a opts=("Debian 官方|http://deb.debian.org/debian")
