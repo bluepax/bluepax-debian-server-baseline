@@ -6,12 +6,12 @@
 
 ## 快速开始
 
-**直接下载单个脚本**：每个版本都在 [Releases](https://github.com/bluepax/bluepax-debian-server-baseline/releases) 中附带 `debian-baseline.sh` 和它的 `.sha256` 校验文件，不需要克隆仓库：
+**直接下载单个脚本**：每个版本都在 [Releases](https://github.com/bluepax/debian-server-baseline/releases) 中附带 `debian-baseline.sh` 和它的 `.sha256` 校验文件，不需要克隆仓库：
 
 ```bash
 TAG=v1.0.0-beta.4
-curl -fsSLO https://github.com/bluepax/bluepax-debian-server-baseline/releases/download/$TAG/debian-baseline.sh
-curl -fsSL https://github.com/bluepax/bluepax-debian-server-baseline/releases/download/$TAG/debian-baseline.sh.sha256 | sha256sum -c -
+curl -fsSLO https://github.com/bluepax/debian-server-baseline/releases/download/$TAG/debian-baseline.sh
+curl -fsSL https://github.com/bluepax/debian-server-baseline/releases/download/$TAG/debian-baseline.sh.sha256 | sha256sum -c -
 sudo bash debian-baseline.sh
 ```
 
@@ -20,8 +20,8 @@ sudo bash debian-baseline.sh
 **或者克隆仓库**：
 
 ```bash
-git clone https://github.com/bluepax/bluepax-debian-server-baseline.git
-cd bluepax-debian-server-baseline
+git clone https://github.com/bluepax/debian-server-baseline.git
+cd debian-server-baseline
 sudo ./debian-baseline.sh
 ```
 
