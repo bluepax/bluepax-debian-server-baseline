@@ -9,13 +9,13 @@
 **直接下载单个脚本**：每个版本都在 [Releases](https://github.com/bluepax/debian-server-baseline/releases) 中附带 `debian-baseline.sh` 和它的 `.sha256` 校验文件，不需要克隆仓库：
 
 ```bash
-TAG=v1.0.0-beta.4
-curl -fsSLO https://github.com/bluepax/debian-server-baseline/releases/download/$TAG/debian-baseline.sh
-curl -fsSL https://github.com/bluepax/debian-server-baseline/releases/download/$TAG/debian-baseline.sh.sha256 | sha256sum -c -
+# 最新正式版
+curl -fsSLO https://github.com/bluepax/debian-server-baseline/releases/latest/download/debian-baseline.sh
+curl -fsSL https://github.com/bluepax/debian-server-baseline/releases/latest/download/debian-baseline.sh.sha256 | sha256sum -c -
 sudo bash debian-baseline.sh
 ```
 
-正式版发布后，可以用 `releases/latest/download/debian-baseline.sh` 始终下载最新正式版。beta 版属于预发布，不会被 `latest` 指向。
+要固定使用某个版本，把 `latest/download` 换成 `download/<标签>`，例如 `download/v1.0.0`。beta 版属于预发布，`latest` 不会指向它们。
 
 **或者克隆仓库**：
 

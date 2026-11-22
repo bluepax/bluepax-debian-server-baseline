@@ -26,8 +26,8 @@ shopt -s nullglob
 # ---------------------------------------------------------------- 版本信息 ---
 # Bluepax Flow：SemVer 2.0，新主版本预发布为 X.0.0-beta.N，
 # N 为 build 号 = git rev-list --count --first-parent <dev 提交>
-SCRIPT_VERSION="1.0.0-beta.4"
-SCRIPT_BUILD="4"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_BUILD="5"
 SCRIPT_CODENAME="petrel"
 # 提交号与构建时间：git archive 时由 export-subst 填入（见 .gitattributes），
 # install 时写入安装副本，从 git 工作区运行时实时读取
