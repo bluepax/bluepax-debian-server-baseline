@@ -1,0 +1,90 @@
+# Publish a GitHub Release with the script as a downloadable asset
+# whenever a version tag (vX.Y.Z or vX.0.0-beta.N) is pushed.
+#
+# The asset is produced with `git archive`, so export-subst fills in
+# SCRIPT_COMMIT / SCRIPT_DATE and `debian-baseline --version` shows them.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Re-publish a release for an existing tag (e.g. tags pushed before this workflow existed)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish, e.g. v1.0.0-beta.3"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      ASSET: debian-baseline.sh
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the annotated tag
+        # actions/checkout stores tags as lightweight refs; fetch the real tag object
+        run: git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+
+      - name: Check tag format and script version
+        run: |
+          [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]] \
+            || { echo "::error::Tag $TAG is not vX.Y.Z or vX.0.0-beta.N"; exit 1; }
+          [ "$(git cat-file -t "$TAG")" = tag ] \
+            || { echo "::error::$TAG must be an annotated tag"; exit 1; }
+          version=$(git show "${TAG}:${ASSET}" | sed -n 's/^SCRIPT_VERSION="\(.*\)"$/\1/p')
+          [ "v${version}" = "$TAG" ] \
+            || { echo "::error::SCRIPT_VERSION is ${version}, tag is ${TAG}"; exit 1; }
+
+      - name: Build release asset
+        run: |
+          mkdir dist
+          git archive "$TAG" "$ASSET" | tar -x -C dist
+          chmod 0755 "dist/${ASSET}"
+          bash -n "dist/${ASSET}"
+          grep -E '^SCRIPT_(COMMIT|DATE)=' "dist/${ASSET}"
+          (cd dist && sha256sum "$ASSET" > "${ASSET}.sha256")
+
+      - name: Write release notes
+        run: |
+          repo="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          {
+            echo "**$(git tag -l --format='%(contents:subject)' "$TAG")**"
+            echo
+            # main 版本提交的正文；<feature>/<bug> 转成小标题，否则会被当成 HTML 吞掉
+            git log -1 --format=%b "${TAG}^{commit}" \
+              | sed -E -e '/^Co-Authored-By:/d' -e 's/^<([A-Za-z]+)>$/#### \1/' -e 's/^([A-Z])/- \1/'
+            echo
+            echo "### 下载与运行"
+            echo
+            echo '```bash'
+            echo "curl -fsSLO ${repo}/releases/download/${TAG}/${ASSET}"
+            echo "curl -fsSL ${repo}/releases/download/${TAG}/${ASSET}.sha256 | sha256sum -c -"
+            echo "sudo bash ${ASSET}"
+            echo '```'
+          } > notes.md
+          cat notes.md
+
+      - name: Create or update GitHub Release
+        run: |
+          flags=(--title "$TAG" --notes-file notes.md --verify-tag)
+          if [[ $TAG == *-beta.* ]]; then flags+=(--prerelease); else flags+=(--latest); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/${ASSET}" "dist/${ASSET}.sha256" --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "dist/${ASSET}" "dist/${ASSET}.sha256" "${flags[@]}"
+          fi

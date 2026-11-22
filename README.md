@@ -6,6 +6,19 @@
 
 ## 快速开始
 
+**直接下载单个脚本**：每个版本都在 [Releases](https://github.com/bluepax/bluepax-debian-server-baseline/releases) 中附带 `debian-baseline.sh` 和它的 `.sha256` 校验文件，不需要克隆仓库：
+
+```bash
+TAG=v1.0.0-beta.4
+curl -fsSLO https://github.com/bluepax/bluepax-debian-server-baseline/releases/download/$TAG/debian-baseline.sh
+curl -fsSL https://github.com/bluepax/bluepax-debian-server-baseline/releases/download/$TAG/debian-baseline.sh.sha256 | sha256sum -c -
+sudo bash debian-baseline.sh
+```
+
+正式版发布后，可以用 `releases/latest/download/debian-baseline.sh` 始终下载最新正式版。beta 版属于预发布，不会被 `latest` 指向。
+
+**或者克隆仓库**：
+
 ```bash
 git clone https://github.com/bluepax/bluepax-debian-server-baseline.git
 cd bluepax-debian-server-baseline
@@ -106,6 +119,12 @@ sudo debian-baseline apply && sudo debian-baseline check        # 升级后重�
 - 版本号采用 SemVer 2.0。新主版本先发布 `X.0.0-beta.N`，N 是 build 号（`git rev-list --count --first-parent <dev 提交>`）；之后发布的 `X.0.0` 即正式版。次版本和修订版不设 beta。
 - 每个主版本有一个代号，取自天空中的生物。1.x 的代号为 `petrel`（海燕）。
 - `dev` 是默认分支，用于开发与热修复。`main` 只用于发布，每个提交都有附注标签 `vX.Y.Z`。功能在 `feature/*`、`fix/*` 分支上开发，通过 `--no-ff` 合并提交合入 `dev`。
+- 推送 `v*` 标签时，[release 工作流](.github/workflows/release.yml) 会自动完成以下工作：
+  1. 校验标签格式，并确认它是附注标签、与脚本里的 `SCRIPT_VERSION` 一致；
+  2. 用 `git archive` 生成脚本，提交号和构建时间会自动填入，再生成 sha256 校验文件；
+  3. 用 `main` 上版本提交的正文作为发布说明，创建 GitHub Release，beta 版标记为预发布。
+
+  对于工作流加入前就已存在的标签，可以在 Actions 页面手动运行 `release` 工作流并填入标签名，补发 Release。
 - `debian-baseline --version` 显示版本号、代号、build 号、构建时间和提交号。这些信息的来源：从 git 工作区运行时实时读取；GitHub 源码包由 `export-subst` 填入；安装到 `/usr/local/sbin` 时写入安装副本。
 
 ## 许可证
